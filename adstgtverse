@@ -1,0 +1,182 @@
+import asyncio
+import requests
+from playwright.async_api import async_playwright, TimeoutError
+from loguru import logger
+import sys
+from datetime import datetime, timedelta
+
+# Настройка логирования
+logger.remove()
+logger.add(
+    sys.stdout,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>",
+    level="INFO"
+)
+logger.add(
+    "dust_collector_{time}.log",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
+    level="INFO",
+    rotation="1 day"
+)
+
+
+class DustCollectorBot:
+    def __init__(self, profile_id, telegram_url):
+        self.profile_id = profile_id
+        self.telegram_url = telegram_url
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.iframe = None
+        self.playwright = None
+        self.api_base_url = "http://local.adspower.net:50325/api/v1"
+        self.dust_buttons_xpath = [
+            "//span[contains(text(), 'Собрать пыль')]",
+            "//span[contains(text(), 'Collect Stardust')]",
+            "//button[contains(text(), 'Collect Stardust')]",
+            "//*[@id='ui-bottom']/a[2]",
+            "//*[@id='ui-bottom']/a[2]/svg",
+            "//*[@id='ui-bottom']/a[2]/svg/path[1]",
+            "//*[@id='ui-bottom']/a[2]/svg/path[2]",
+            "//*[@id='ui-bottom']/a[2]/div[2]",
+            "//*[@id='ui-bottom']/a[2]/span",
+        ]
+
+    def start_browser(self):
+        """Запуск браузера через API adspower"""
+        start_url = f"{self.api_base_url}/browser/start?user_id={self.profile_id}"
+        response = requests.get(start_url)
+        data = response.json()
+
+        if data["code"] != 0:
+            raise Exception(f"Ошибка запуска браузера: {data['msg']}")
+
+        return data["data"]
+
+    async def setup(self):
+        """Инициализация браузера и настройка страницы"""
+        try:
+            logger.info(f"Начало настройки для профиля {self.profile_id}")
+
+            browser_data = self.start_browser()
+            ws_url = browser_data["ws"].get("selenium")
+
+            if not ws_url:
+                raise Exception("Не получен WebSocket URL")
+
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.connect_over_cdp(f"http://{ws_url}")
+            self.context = self.browser.contexts[0]
+            self.page = self.context.pages[0]
+
+            # Открытие Telegram
+            await self.page.goto(self.telegram_url, wait_until="networkidle", timeout=30000)
+            logger.info(f"Открыт Telegram Web для профиля {self.profile_id}")
+            await asyncio.sleep(5)
+
+            # Клик по ссылке бота
+            link = await self.page.wait_for_selector(
+                "//a[contains(@href, 'https://t.me/TVerse?startapp=galaxy')]",
+                timeout=15000,
+                state="visible"
+            )
+            await link.click()
+            logger.success(f"Кликнули по ссылке бота для профиля {self.profile_id}")
+            await asyncio.sleep(5)
+
+            # Получение iframe
+            iframe_element = await self.page.wait_for_selector("iframe", timeout=15000)
+            self.iframe = await iframe_element.content_frame()
+            logger.info(f"Успешно получили iframe для профиля {self.profile_id}")
+            await asyncio.sleep(5)
+
+            # Нажимаем на кнопку домика, если она есть
+            try:
+                exit_button = await self.iframe.wait_for_selector(
+                    "//*[@id='ui-top-right']/a",
+                    timeout=5000,
+                    state="visible"
+                )
+                if exit_button:
+                    await exit_button.click()
+                    logger.info(f"Нажали кнопку выхода в меню для профиля {self.profile_id}")
+                    await asyncio.sleep(2)
+            except TimeoutError:
+                logger.debug(f"Кнопка выхода не найдена для профиля {self.profile_id}")
+
+            logger.success(f"Настройка завершена для профиля {self.profile_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при настройке профиля {self.profile_id}: {e}")
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+            return False
+
+    async def try_collect_dust(self):
+        """Попытка собрать пыль, используя разные селекторы"""
+        dust_collected = False
+        for xpath in self.dust_buttons_xpath:
+            try:
+                await self.iframe.click(xpath)
+                logger.success(f"Собрали пыль используя селектор {xpath} для профиля {self.profile_id}")
+                dust_collected = True
+                break
+            except Exception:
+                continue
+        return dust_collected
+
+    async def collect_dust(self):
+        """Основной метод сбора пыли"""
+        while True:
+            try:
+                if not self.browser or not self.page:
+                    setup_success = await self.setup()
+                    if not setup_success:
+                        logger.error(f"Не удалось настроить профиль {self.profile_id}, ожидание 60 секунд")
+                        await asyncio.sleep(60)
+                        continue
+
+                # Пытаемся собрать пыль используя разные селекторы
+                collection_time = datetime.now().strftime('%H:%M:%S')
+                if await self.try_collect_dust():
+                    logger.success(f"Успешно собрали пыль для профиля {self.profile_id} в {collection_time}")
+                else:
+                    logger.warning(f"Не удалось собрать пыль для профиля {self.profile_id} в {collection_time}")
+
+                # Ждем 30 минут перед следующей попыткой
+                next_collection = (datetime.now() + timedelta(minutes=30)).strftime('%H:%M:%S')
+                logger.info(f"Следующий сбор пыли для профиля {self.profile_id} в {next_collection}")
+                await asyncio.sleep(2933)
+
+            except Exception as e:
+                logger.error(f"Критическая ошибка для профиля {self.profile_id}: {e}")
+                if self.browser:
+                    await self.browser.close()
+                if self.playwright:
+                    await self.playwright.stop()
+                self.browser = None
+                self.page = None
+                self.iframe = None
+                await asyncio.sleep(60)
+
+
+async def main():
+    logger.info("Запуск программы сбора пыли")
+    profiles = {
+        "id profile ads": "ссылка на избранное в тг где ссылка на тверс",
+        "": "",
+
+    }
+    logger.info(f"Загружено {len(profiles)} профилей")
+    bots = [DustCollectorBot(profile_id, telegram_url) for profile_id, telegram_url in profiles.items()]
+    tasks = [asyncio.create_task(bot.collect_dust()) for bot in bots]
+
+    await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    logger.info("Старт программы")
+    asyncio.run(main())
